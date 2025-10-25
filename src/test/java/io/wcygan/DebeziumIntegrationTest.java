@@ -40,7 +40,7 @@ class DebeziumIntegrationTest {
 
     private final PostgreSQLContainer<?> postgresContainer =
             new PostgreSQLContainer<>(
-                    DockerImageName.parse("quay.io/debezium/postgres:15")
+                    DockerImageName.parse("quay.io/debezium/postgres:18")
                             .asCompatibleSubstituteFor("postgres"))
                     .withNetwork(network)
                     .withNetworkAliases("postgres");
