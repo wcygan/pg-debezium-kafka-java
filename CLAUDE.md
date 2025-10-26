@@ -91,3 +91,13 @@ mvn versions:display-dependency-updates
 - TestContainers 1.19.7
 - Debezium 3.3.1.Final
 - Kafka 3.7.0
+
+## RedPanda CDC Test (Currently Disabled)
+
+`RedpandaDebeziumIntegrationTest` demonstrates the same CDC pipeline using RedPanda instead of Kafka, but is currently disabled due to a known Testcontainers limitation.
+
+**Issue**: RedPanda Testcontainers has difficulty with container-to-container communication when Debezium Connect needs to resolve RedPanda's bootstrap servers on the internal Docker network. GitHub issue: https://github.com/testcontainers/testcontainers-java/issues/6395
+
+**Workaround**: For production CDC with RedPanda, use Docker Compose. See: https://docs.redpanda.com/redpanda-labs/docker-compose/cdc-postgres-json/
+
+**Test Status**: The test file exists in `src/test/java/io/wcygan/RedpandaDebeziumIntegrationTest.java` and is marked with `@Disabled`. It will be enabled once the Testcontainers issue is resolved.
