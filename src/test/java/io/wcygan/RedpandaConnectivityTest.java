@@ -1,5 +1,8 @@
 package io.wcygan;
 
+import static io.wcygan.testutil.ContainerHelper.createSimpleRedpandaContainer;
+
+import io.wcygan.testutil.TestConstants;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -22,8 +25,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.utility.DockerImageName;
 
 /**
  * Isolated test for RedPanda connectivity and basic produce/consume functionality.
@@ -31,16 +32,7 @@ import org.testcontainers.utility.DockerImageName;
 @TestInstance(Lifecycle.PER_CLASS)
 class RedpandaConnectivityTest {
 
-    private final GenericContainer<?> redpandaContainer =
-            new GenericContainer<>(DockerImageName.parse("docker.redpanda.com/redpandadata/redpanda:v23.3.3"))
-                    .withCommand(
-                            "redpanda",
-                            "start",
-                            "--mode=dev-container",
-                            "--kafka-addr=0.0.0.0:9092")
-                    .withExposedPorts(9092)
-                    .waitingFor(Wait.forLogMessage(".*Successfully started Redpanda!.*", 1)
-                            .withStartupTimeout(Duration.ofMinutes(2)));
+    private final GenericContainer<?> redpandaContainer = createSimpleRedpandaContainer();
 
     @BeforeAll
     void startContainer() {
@@ -54,19 +46,23 @@ class RedpandaConnectivityTest {
 
     @Test
     void canProduceAndConsumeMessages() throws Exception {
-        String bootstrapServers = redpandaContainer.getHost() + ":" + redpandaContainer.getMappedPort(9092);
+        String bootstrapServers =
+                redpandaContainer.getHost() + ":" + redpandaContainer.getMappedPort(TestConstants.REDPANDA_KAFKA_PORT);
         String topicName = "test-topic-" + UUID.randomUUID();
 
-        System.out.println("Bootstrap servers: " + bootstrapServers);
+        createTopic(bootstrapServers, topicName);
+        produceMessages(bootstrapServers, topicName);
+        consumeAndValidateMessages(bootstrapServers, topicName);
+    }
 
-        // Create topic
-        try (AdminClient adminClient = AdminClient.create(Map.of(
-                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers))) {
+    private void createTopic(String bootstrapServers, String topicName) throws Exception {
+        try (AdminClient adminClient = AdminClient.create(
+                Map.of(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers))) {
             adminClient.createTopics(List.of(new NewTopic(topicName, 1, (short) 1))).all().get();
-            System.out.println("Topic created: " + topicName);
         }
+    }
 
-        // Produce messages
+    private void produceMessages(String bootstrapServers, String topicName) throws Exception {
         try (KafkaProducer<String, String> producer = new KafkaProducer<>(
                 Map.of(
                         ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
@@ -76,10 +72,10 @@ class RedpandaConnectivityTest {
 
             producer.send(new ProducerRecord<>(topicName, "key1", "value1")).get();
             producer.send(new ProducerRecord<>(topicName, "key2", "value2")).get();
-            System.out.println("Produced 2 messages");
         }
+    }
 
-        // Consume messages
+    private void consumeAndValidateMessages(String bootstrapServers, String topicName) {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(
                 Map.of(
                         ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
@@ -93,17 +89,10 @@ class RedpandaConnectivityTest {
             List<ConsumerRecord<String, String>> records = new ArrayList<>();
             long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
 
-            // First poll with longer timeout for partition assignment
-            consumer.poll(Duration.ofMillis(1000)).forEach(r -> {
-                System.out.println("Received: key=" + r.key() + ", value=" + r.value());
-                records.add(r);
-            });
+            consumer.poll(TestConstants.POLL_TIMEOUT_FIRST).forEach(records::add);
 
             while (System.nanoTime() < deadline && records.size() < 2) {
-                consumer.poll(Duration.ofMillis(200)).forEach(r -> {
-                    System.out.println("Received: key=" + r.key() + ", value=" + r.value());
-                    records.add(r);
-                });
+                consumer.poll(TestConstants.POLL_TIMEOUT).forEach(records::add);
             }
 
             Assertions.assertEquals(2, records.size(), "Should receive 2 messages");

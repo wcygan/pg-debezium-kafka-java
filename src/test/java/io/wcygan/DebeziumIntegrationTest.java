@@ -1,24 +1,20 @@
 package io.wcygan;
 
-import com.jayway.jsonpath.JsonPath;
+import static io.wcygan.testutil.CdcTestHelper.*;
+import static io.wcygan.testutil.ContainerHelper.createPostgresContainer;
+import static io.wcygan.testutil.KafkaTestHelper.*;
+
 import io.debezium.testing.testcontainers.ConnectorConfiguration;
 import io.debezium.testing.testcontainers.DebeziumContainer;
+import io.wcygan.testutil.CdcEvent;
+import io.wcygan.testutil.TestConstants;
 import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.UUID;
 import java.util.stream.Stream;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.serialization.StringDeserializer;
-import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -35,18 +31,13 @@ class DebeziumIntegrationTest {
     private final Network network = Network.newNetwork();
 
     private final KafkaContainer kafkaContainer =
-            new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.0"))
+            new KafkaContainer(DockerImageName.parse(TestConstants.KAFKA_IMAGE))
                     .withNetwork(network);
 
-    private final PostgreSQLContainer<?> postgresContainer =
-            new PostgreSQLContainer<>(
-                    DockerImageName.parse("quay.io/debezium/postgres:18")
-                            .asCompatibleSubstituteFor("postgres"))
-                    .withNetwork(network)
-                    .withNetworkAliases("postgres");
+    private final PostgreSQLContainer<?> postgresContainer = createPostgresContainer(network);
 
     private final DebeziumContainer debeziumContainer =
-            new DebeziumContainer("quay.io/debezium/connect:3.3.1.Final")
+            new DebeziumContainer(TestConstants.DEBEZIUM_IMAGE)
                     .withNetwork(network)
                     .withKafka(kafkaContainer)
                     .dependsOn(kafkaContainer);
@@ -67,74 +58,39 @@ class DebeziumIntegrationTest {
 
     @Test
     void postgresConnectorCapturesChanges() throws Exception {
-        try (Connection connection = getConnection();
-                Statement statement = connection.createStatement();
-                KafkaConsumer<String, String> consumer = createConsumer()) {
+        try (Connection connection = getConnection(postgresContainer);
+                KafkaConsumer<String, String> consumer = createConsumer(kafkaContainer.getBootstrapServers())) {
 
-            statement.execute("create schema todo");
-            statement.execute(
-                    "create table todo.Todo (id bigint not null, title varchar(255), primary key (id))");
-            statement.execute("alter table todo.Todo replica identity full");
-            statement.execute("insert into todo.Todo values (1, 'Learn CDC')");
-            statement.execute("insert into todo.Todo values (2, 'Learn Debezium')");
+            // Setup database
+            setupTestDatabase(connection);
+            insertTestRecord(connection, 1, "Learn CDC");
+            insertTestRecord(connection, 2, "Learn Debezium");
 
+            // Register Debezium connector using DebeziumContainer helper
             ConnectorConfiguration connectorConfiguration =
                     ConnectorConfiguration.forJdbcContainer(postgresContainer)
-                            .with("topic.prefix", "dbserver1");
+                            .with("topic.prefix", TestConstants.TOPIC_PREFIX);
 
             debeziumContainer.registerConnector("todo-connector", connectorConfiguration);
 
-            consumer.subscribe(List.of("dbserver1.todo.todo"));
+            // Consume CDC events
+            consumer.subscribe(List.of(getTestTopicName()));
+            List<ConsumerRecord<String, String>> records =
+                    drainEvents(consumer, 2, TestConstants.EVENT_CONSUMPTION_TIMEOUT);
 
-            List<ConsumerRecord<String, String>> changeEvents = drain(consumer, 2, Duration.ofSeconds(20));
+            // Validate events
+            List<CdcEvent> events = toCdcEvents(records);
 
-            ConsumerRecord<String, String> firstRecord = changeEvents.get(0);
-            Number firstId = JsonPath.read(firstRecord.key(), "$.id");
-            Assertions.assertEquals(1, firstId.intValue(), "first record key id");
-            Assertions.assertEquals("r", JsonPath.read(firstRecord.value(), "$.op"), "first record operation");
-            Assertions.assertEquals(
-                    "Learn CDC", JsonPath.read(firstRecord.value(), "$.after.title"), "first record title");
+            CdcEvent firstEvent = events.get(0);
+            Assertions.assertEquals(1, firstEvent.getId());
+            Assertions.assertTrue(firstEvent.isReadOperation());
+            Assertions.assertEquals("Learn CDC", firstEvent.getTitle());
 
-            ConsumerRecord<String, String> secondRecord = changeEvents.get(1);
-            Number secondId = JsonPath.read(secondRecord.key(), "$.id");
-            Assertions.assertEquals(2, secondId.intValue(), "second record key id");
-            Assertions.assertEquals("r", JsonPath.read(secondRecord.value(), "$.op"), "second record operation");
-            Assertions.assertEquals(
-                    "Learn Debezium", JsonPath.read(secondRecord.value(), "$.after.title"), "second record title");
+            CdcEvent secondEvent = events.get(1);
+            Assertions.assertEquals(2, secondEvent.getId());
+            Assertions.assertTrue(secondEvent.isReadOperation());
+            Assertions.assertEquals("Learn Debezium", secondEvent.getTitle());
         }
     }
 
-    private Connection getConnection() throws SQLException {
-        return DriverManager.getConnection(
-                postgresContainer.getJdbcUrl(), postgresContainer.getUsername(), postgresContainer.getPassword());
-    }
-
-    private KafkaConsumer<String, String> createConsumer() {
-        return new KafkaConsumer<>(
-                Map.of(
-                        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaContainer.getBootstrapServers(),
-                        ConsumerConfig.GROUP_ID_CONFIG, "tc-" + UUID.randomUUID(),
-                        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"),
-                new StringDeserializer(),
-                new StringDeserializer());
-    }
-
-    private List<ConsumerRecord<String, String>> drain(
-            KafkaConsumer<String, String> consumer, int expectedRecordCount,
-            Duration timeout) {
-
-        List<ConsumerRecord<String, String>> records = new ArrayList<>();
-        long deadline = System.nanoTime() + timeout.toNanos();
-
-        while (System.nanoTime() < deadline && records.size() < expectedRecordCount) {
-            consumer.poll(Duration.ofMillis(200)).forEach(records::add);
-        }
-
-        if (records.size() < expectedRecordCount) {
-            throw new AssertionError(
-                    "Expected " + expectedRecordCount + " change events but received " + records.size());
-        }
-
-        return records;
-    }
 }
