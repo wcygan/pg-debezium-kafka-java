@@ -90,6 +90,29 @@ public final class CdcEvent {
     }
 
     /**
+     * Gets the title from the "before" section (for updates/deletes).
+     */
+    public String getBeforeTitle() {
+        return getBeforeField("title", String.class);
+    }
+
+    /**
+     * Checks if the "before" section is null (true for inserts/reads).
+     */
+    public boolean hasBeforeState() {
+        Object before = JsonPath.read(value, "$.before");
+        return before != null;
+    }
+
+    /**
+     * Checks if the "after" section is null (true for deletes).
+     */
+    public boolean hasAfterState() {
+        Object after = JsonPath.read(value, "$.after");
+        return after != null;
+    }
+
+    /**
      * Gets the raw key JSON.
      */
     public String getKey() {

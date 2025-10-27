@@ -46,7 +46,8 @@ public final class CdcTestHelper {
      */
     public static void setupTestDatabase(Connection connection) throws SQLException {
         try (Statement statement = connection.createStatement()) {
-            statement.execute("create schema " + TestConstants.SCHEMA_NAME);
+            statement.execute("create schema if not exists " + TestConstants.SCHEMA_NAME);
+            statement.execute("drop table if exists " + TestConstants.FULL_TABLE_NAME);
             statement.execute(
                     "create table " + TestConstants.FULL_TABLE_NAME
                             + " (id bigint not null, title varchar(255), primary key (id))");
@@ -67,6 +68,61 @@ public final class CdcTestHelper {
             statement.execute(
                     "insert into " + TestConstants.FULL_TABLE_NAME
                             + " values (" + id + ", '" + title + "')");
+        }
+    }
+
+    /**
+     * Updates a test record in the database.
+     *
+     * @param connection database connection
+     * @param id record ID to update
+     * @param newTitle new title value
+     * @throws SQLException if update fails
+     */
+    public static void updateTestRecord(Connection connection, long id, String newTitle) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "update " + TestConstants.FULL_TABLE_NAME
+                            + " set title = '" + newTitle + "' where id = " + id);
+        }
+    }
+
+    /**
+     * Deletes a test record from the database.
+     *
+     * @param connection database connection
+     * @param id record ID to delete
+     * @throws SQLException if delete fails
+     */
+    public static void deleteTestRecord(Connection connection, long id) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("delete from " + TestConstants.FULL_TABLE_NAME + " where id = " + id);
+        }
+    }
+
+    /**
+     * Inserts multiple test records in a single transaction.
+     *
+     * @param connection database connection
+     * @param records array of (id, title) pairs
+     * @throws SQLException if bulk insert fails
+     */
+    public static void bulkInsertTestRecords(Connection connection, Object[][] records) throws SQLException {
+        connection.setAutoCommit(false);
+        try (Statement statement = connection.createStatement()) {
+            for (Object[] record : records) {
+                long id = (Long) record[0];
+                String title = (String) record[1];
+                statement.execute(
+                        "insert into " + TestConstants.FULL_TABLE_NAME
+                                + " values (" + id + ", '" + title + "')");
+            }
+            connection.commit();
+        } catch (SQLException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(true);
         }
     }
 
