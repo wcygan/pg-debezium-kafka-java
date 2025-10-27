@@ -20,7 +20,6 @@ import java.util.stream.Stream;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
@@ -56,6 +55,7 @@ class RedpandaDebeziumIntegrationTest {
 
     private final RedpandaContainer redpandaContainer =
             new RedpandaContainer(DockerImageName.parse("docker.redpanda.com/redpandadata/redpanda:v23.3.3"))
+                    .withListener(() -> "redpanda:19092")
                     .withNetwork(network)
                     .withNetworkAliases("redpanda");
 
@@ -69,13 +69,13 @@ class RedpandaDebeziumIntegrationTest {
     private final GenericContainer<?> debeziumContainer =
             new GenericContainer<>(DockerImageName.parse("quay.io/debezium/connect:3.3.1.Final"))
                     .withNetwork(network)
-                    .withEnv("BOOTSTRAP_SERVERS", "redpanda:9092")
+                    .withEnv("BOOTSTRAP_SERVERS", "redpanda:19092")
                     .withEnv("GROUP_ID", "1")
                     .withEnv("CONFIG_STORAGE_TOPIC", "debezium_configs")
                     .withEnv("OFFSET_STORAGE_TOPIC", "debezium_offsets")
                     .withEnv("STATUS_STORAGE_TOPIC", "debezium_statuses")
-                    .withEnv("KEY_CONVERTER_SCHEMAS_ENABLE", "false")
-                    .withEnv("VALUE_CONVERTER_SCHEMAS_ENABLE", "false")
+                    .withEnv("CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE", "false")
+                    .withEnv("CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE", "false")
                     .withExposedPorts(8083)
                     .waitingFor(Wait.forHttp("/connectors").forStatusCode(200).withStartupTimeout(Duration.ofMinutes(3)))
                     .dependsOn(redpandaContainer);
@@ -121,47 +121,26 @@ class RedpandaDebeziumIntegrationTest {
 
             registerConnector("todo-connector", connectorConfig);
 
-            // Wait for topic to be created
-            Thread.sleep(5000);
+            // Wait for Debezium snapshot to complete
+            waitForSnapshotCompletion(Duration.ofSeconds(30));
 
-            // List topics to verify topic exists
-            var topics = consumer.listTopics();
-            System.out.println("Available topics: " + topics.keySet());
+            consumer.subscribe(List.of("dbserver1.todo.todo"));
 
-            // Manually assign partition instead of subscribing to avoid consumer group coordination
-            var partitionInfos = topics.get("dbserver1.todo.todo");
-            System.out.println("Topic partitions: " + partitionInfos);
-
-            if (partitionInfos != null && !partitionInfos.isEmpty()) {
-                var topicPartitions = partitionInfos.stream()
-                        .map(pi -> new TopicPartition(pi.topic(), pi.partition()))
-                        .toList();
-                consumer.assign(topicPartitions);
-                consumer.seekToBeginning(topicPartitions);
-                System.out.println("Assigned partitions: " + consumer.assignment());
-            } else {
-                throw new IllegalStateException("Topic dbserver1.todo.todo has no partitions");
-            }
-
-            System.out.println("About to start draining messages...");
-
-            List<ConsumerRecord<String, String>> changeEvents = drain(consumer, 2, Duration.ofSeconds(20));
-
-            System.out.println("Drained " + changeEvents.size() + " messages");
+            List<ConsumerRecord<String, String>> changeEvents = drain(consumer, 2, Duration.ofSeconds(30));
 
             ConsumerRecord<String, String> firstRecord = changeEvents.get(0);
-            Number firstId = JsonPath.read(firstRecord.key(), "$.payload.id");
+            Number firstId = JsonPath.read(firstRecord.key(), "$.id");
             Assertions.assertEquals(1, firstId.intValue(), "first record key id");
-            Assertions.assertEquals("r", JsonPath.read(firstRecord.value(), "$.payload.op"), "first record operation");
+            Assertions.assertEquals("r", JsonPath.read(firstRecord.value(), "$.op"), "first record operation");
             Assertions.assertEquals(
-                    "Learn CDC", JsonPath.read(firstRecord.value(), "$.payload.after.title"), "first record title");
+                    "Learn CDC", JsonPath.read(firstRecord.value(), "$.after.title"), "first record title");
 
             ConsumerRecord<String, String> secondRecord = changeEvents.get(1);
-            Number secondId = JsonPath.read(secondRecord.key(), "$.payload.id");
+            Number secondId = JsonPath.read(secondRecord.key(), "$.id");
             Assertions.assertEquals(2, secondId.intValue(), "second record key id");
-            Assertions.assertEquals("r", JsonPath.read(secondRecord.value(), "$.payload.op"), "second record operation");
+            Assertions.assertEquals("r", JsonPath.read(secondRecord.value(), "$.op"), "second record operation");
             Assertions.assertEquals(
-                    "Learn RedPanda", JsonPath.read(secondRecord.value(), "$.payload.after.title"), "second record title");
+                    "Learn RedPanda", JsonPath.read(secondRecord.value(), "$.after.title"), "second record title");
         }
     }
 
@@ -171,11 +150,9 @@ class RedpandaDebeziumIntegrationTest {
     }
 
     private KafkaConsumer<String, String> createConsumer() {
-        String bootstrapServers = redpandaContainer.getBootstrapServers();
-        System.out.println("Consumer bootstrap servers: " + bootstrapServers);
         return new KafkaConsumer<>(
                 Map.of(
-                        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
+                        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, redpandaContainer.getBootstrapServers(),
                         ConsumerConfig.GROUP_ID_CONFIG, "tc-" + UUID.randomUUID(),
                         ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"),
                 new StringDeserializer(),
@@ -186,24 +163,15 @@ class RedpandaDebeziumIntegrationTest {
             KafkaConsumer<String, String> consumer, int expectedRecordCount,
             Duration timeout) {
 
-        System.out.println("drain(): Starting to poll for " + expectedRecordCount + " records");
         List<ConsumerRecord<String, String>> records = new ArrayList<>();
         long deadline = System.nanoTime() + timeout.toNanos();
 
-        int pollCount = 0;
-        while (System.nanoTime() < deadline && records.size() < expectedRecordCount) {
-            var polled = consumer.poll(Duration.ofMillis(200));
-            pollCount++;
-            if (polled.count() > 0) {
-                System.out.println("drain(): Poll #" + pollCount + " received " + polled.count() + " records");
-                polled.forEach(r -> {
-                    System.out.println("drain(): Record key: " + r.key().substring(0, Math.min(100, r.key().length())));
-                    records.add(r);
-                });
-            }
-        }
+        // First poll with longer timeout to allow partition assignment
+        consumer.poll(Duration.ofMillis(1000)).forEach(records::add);
 
-        System.out.println("drain(): Finished after " + pollCount + " polls, got " + records.size() + " records");
+        while (System.nanoTime() < deadline && records.size() < expectedRecordCount) {
+            consumer.poll(Duration.ofMillis(200)).forEach(records::add);
+        }
 
         if (records.size() < expectedRecordCount) {
             throw new AssertionError(
@@ -237,6 +205,21 @@ class RedpandaDebeziumIntegrationTest {
                     "Failed to register connector. Status: " + response.statusCode()
                             + ", Body: " + response.body());
         }
+    }
+
+    private void waitForSnapshotCompletion(Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+
+        while (System.nanoTime() < deadline) {
+            String logs = debeziumContainer.getLogs();
+            if (logs.contains("Snapshot") && logs.contains("completed")) {
+                System.out.println("Debezium snapshot completed successfully");
+                return;
+            }
+            Thread.sleep(500);
+        }
+
+        throw new AssertionError("Debezium snapshot did not complete within " + timeout.toSeconds() + " seconds");
     }
 
     private String getConnectorStatus(String name) throws IOException, InterruptedException {
